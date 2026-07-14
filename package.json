@@ -1,0 +1,31 @@
+{
+  "name": "@fin-integrity/browser",
+  "version": "0.1.0",
+  "description": "Frontend tracing SDK for fin-integrity — trace a transaction from the browser all the way to your ledger.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["fin-integrity", "reconciliation", "tracing", "payments", "frontend", "browser", "sdk"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/HatemSaadallah/fin-integrity-browser" },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^2.1.0"
+  }
+}
