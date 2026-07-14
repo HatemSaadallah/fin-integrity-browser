@@ -15,6 +15,22 @@ The browser SDK generates a **trace id** for a checkout and emits lightweight br
 npm install @fin-integrity/browser
 ```
 
+### Or drop in a `<script>` tag (no build step)
+
+The SDK ships a minified global build usable straight from a CDN — it exposes `window.FinIntegrity`:
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/@fin-integrity/browser/dist/index.global.js"></script>
+<!-- or: https://unpkg.com/@fin-integrity/browser -->
+<script>
+  const fi = FinIntegrity.init({ publicKey: "fi_pk_live_…" });
+  const traceId = fi.startCheckout({ reference: "order_10432" });
+  fi.breadcrumb("redirect_to_processor");
+</script>
+```
+
+Pin a version for production, e.g. `…/@fin-integrity/browser@0.1.0/dist/index.global.js`.
+
 ## Usage
 
 ```ts
