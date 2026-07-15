@@ -25,6 +25,10 @@ export interface BrowserConfig {
   endpoint?: string;
   /** Flush interval in ms. Default 3000. */
   flushMs?: number;
+  /** Max breadcrumbs per HTTP request. Default 100 (ingest hard-caps at 500). */
+  maxBatchSize?: number;
+  /** Max breadcrumbs held in memory. Oldest are dropped past this. Default 1000. */
+  maxQueueSize?: number;
   /** Log transport activity. Default false. */
   debug?: boolean;
   /** Called on any internal error. The SDK never throws. */
@@ -34,26 +38,79 @@ export interface BrowserConfig {
 }
 
 const DEFAULT_ENDPOINT = "https://ingest.fin-integrity.com";
+/** Cap on retained delivered breadcrumbs — inspect() is a debugging aid, not a log. */
+const SENT_HISTORY_LIMIT = 500;
+
+/** A key that must never leave the server was handed to the browser SDK. */
+export class SecretKeyError extends Error {
+  constructor() {
+    super(
+      "fin-integrity: a SECRET key (fi_sk_…) was passed to the browser SDK. It has NOT been sent " +
+        "anywhere, and client events are disabled. Secret keys must never ship in client JS — " +
+        "rotate this key and use a publishable key (fi_pk_…) here.",
+    );
+    this.name = "SecretKeyError";
+  }
+}
+
+/** Per-event rejections hiding inside an HTTP 200. Surfaced via onError, never thrown into the page. */
+export class RejectedEventsError extends Error {
+  constructor(
+    readonly rejected: RejectedEvent[],
+    readonly batchSize: number,
+  ) {
+    const detail = rejected.map((r) => `${r.event_id}: ${r.error}`).join("; ");
+    super(`fin-integrity: ingest rejected ${rejected.length}/${batchSize} client event(s) — ${detail}`);
+    this.name = "RejectedEventsError";
+  }
+}
+
+export interface RejectedEvent {
+  event_id: string;
+  error: string;
+}
 
 export class FinIntegrityBrowser {
   private readonly publicKey: string;
   private readonly endpoint: string;
+  private readonly maxBatchSize: number;
+  private readonly maxQueueSize: number;
   private readonly debug: boolean;
   private readonly onError: (err: unknown) => void;
   private readonly customTransport?: BrowserConfig["transport"];
+  /** Set when config is unusable for delivery (e.g. a secret key). Queueing stays alive. */
+  private readonly deliveryDisabled?: Error;
   private queue: ClientEvent[] = [];
   private sent: ClientEvent[] = [];
+  private dropped = 0;
   private currentTrace?: string;
   private timer?: ReturnType<typeof setInterval>;
+  private listeners: Array<() => void> = [];
 
   constructor(config: BrowserConfig = {}) {
-    this.publicKey = config.publicKey ?? "";
-    this.endpoint = config.endpoint ?? DEFAULT_ENDPOINT;
-    this.debug = config.debug ?? false;
-    this.onError = config.onError ?? ((e) => { if (this.debug) console.warn("[fin-integrity]", e); });
-    this.customTransport = config.transport;
+    // A misconfigured call must not throw on a checkout page, so tolerate junk.
+    const cfg: BrowserConfig = config != null && typeof config === "object" ? config : {};
+    this.debug = cfg.debug ?? false;
+    this.onError = typeof cfg.onError === "function"
+      ? (e) => { try { cfg.onError!(e); } catch { /* an onError that throws is still not the page's problem */ } }
+      : (e) => { if (this.debug) console.warn("[fin-integrity]", e); };
 
-    const flushMs = config.flushMs ?? 3000;
+    const key = typeof cfg.publicKey === "string" ? cfg.publicKey.trim() : "";
+    if (key.startsWith("fi_sk_")) {
+      // Never retain it: it must not reach a header, a log, or a stack trace.
+      this.publicKey = "";
+      this.deliveryDisabled = new SecretKeyError();
+      this.onError(this.deliveryDisabled);
+    } else {
+      this.publicKey = key;
+    }
+
+    this.endpoint = typeof cfg.endpoint === "string" && cfg.endpoint ? cfg.endpoint : DEFAULT_ENDPOINT;
+    this.maxBatchSize = positiveInt(cfg.maxBatchSize, 100);
+    this.maxQueueSize = positiveInt(cfg.maxQueueSize, 1000);
+    this.customTransport = typeof cfg.transport === "function" ? cfg.transport : undefined;
+
+    const flushMs = positiveInt(cfg.flushMs, 3000);
     if (typeof setInterval === "function") {
       this.timer = setInterval(() => void this.flush(), flushMs);
       // Node-only nicety: don't keep the event loop alive (no-op in browsers).
@@ -63,10 +120,15 @@ export class FinIntegrityBrowser {
     // Drain on page hide so in-flight breadcrumbs aren't lost on navigation.
     if (typeof addEventListener === "function") {
       const drain = () => void this.flush();
-      addEventListener("pagehide", drain);
-      addEventListener("visibilitychange", () => {
+      const onVisibility = () => {
         if (typeof document !== "undefined" && document.visibilityState === "hidden") drain();
-      });
+      };
+      addEventListener("pagehide", drain);
+      addEventListener("visibilitychange", onVisibility);
+      this.listeners.push(
+        () => removeEventListener("pagehide", drain),
+        () => removeEventListener("visibilitychange", onVisibility),
+      );
     }
   }
 
@@ -76,9 +138,16 @@ export class FinIntegrityBrowser {
    * every side of the transaction shares it. Emits a `checkout_started` breadcrumb.
    */
   startCheckout(opts: { reference?: string; traceId?: string; data?: Record<string, unknown> } = {}): string {
-    this.currentTrace = opts.traceId ?? newTraceId();
-    this.breadcrumb("checkout_started", opts.data, { reference: opts.reference });
-    return this.currentTrace;
+    try {
+      const o = opts != null && typeof opts === "object" ? opts : {};
+      this.currentTrace = typeof o.traceId === "string" && o.traceId ? o.traceId : newTraceId();
+      this.breadcrumb("checkout_started", o.data, { reference: o.reference });
+      return this.currentTrace;
+    } catch (err) {
+      this.onError(err); // fail-open — a trace id is still owed to the caller
+      this.currentTrace = this.currentTrace ?? newTraceId();
+      return this.currentTrace;
+    }
   }
 
   /** The current trace id (creates one if none exists yet). */
@@ -94,12 +163,18 @@ export class FinIntegrityBrowser {
     opts: { traceId?: string; reference?: string } = {},
   ): void {
     try {
-      const trace_id = opts.traceId ?? this.trace();
-      this.queue.push({
+      const o = opts != null && typeof opts === "object" ? opts : {};
+      // Ingest silently skips breadcrumbs without a name, so a nameless one would
+      // vanish server-side with a 200. Reject it here where it can be reported.
+      if (typeof name !== "string" || name.length === 0) {
+        throw new Error("fin-integrity: breadcrumb name must be a non-empty string");
+      }
+      const trace_id = typeof o.traceId === "string" && o.traceId ? o.traceId : this.trace();
+      this.enqueue({
         trace_id,
         name,
-        ...(opts.reference != null ? { reference: opts.reference } : {}),
-        ...(data != null ? { data } : {}),
+        ...(o.reference != null ? { reference: String(o.reference) } : {}),
+        ...(data != null ? { data: safeData(data, this.onError) } : {}),
         occurred_at: new Date().toISOString(),
       });
     } catch (err) {
@@ -107,41 +182,151 @@ export class FinIntegrityBrowser {
     }
   }
 
+  private enqueue(ev: ClientEvent): void {
+    // A hostile or looping page must not grow this queue without bound.
+    while (this.queue.length >= this.maxQueueSize) {
+      this.queue.shift(); // drop-oldest
+      this.dropped++;
+    }
+    this.queue.push(ev);
+  }
+
+  /** Breadcrumbs dropped because the queue was full (never silent — also reported via onError). */
+  droppedCount(): number {
+    return this.dropped;
+  }
+
   /** Send queued breadcrumbs now. */
   async flush(): Promise<void> {
     if (this.queue.length === 0) return;
-    const batch = this.queue.splice(0, this.queue.length);
-    try {
-      if (this.customTransport) {
-        await this.customTransport(batch);
-      } else {
-        await this.send(batch);
+    if (this.dropped > 0) {
+      const n = this.dropped;
+      this.dropped = 0;
+      this.onError(new Error(`fin-integrity: dropped ${n} breadcrumb(s) — queue full (maxQueueSize)`));
+    }
+    // Splice first: a concurrent flush must not send the same batch twice.
+    const pending = this.queue.splice(0, this.queue.length);
+    // Ingest hard-caps a request at 500 events and `keepalive` bodies are capped
+    // at 64KB, so an oversized batch would be rejected whole. Chunk instead.
+    for (let i = 0; i < pending.length; i += this.maxBatchSize) {
+      const batch = pending.slice(i, i + this.maxBatchSize);
+      try {
+        if (this.customTransport) {
+          await this.customTransport(batch);
+        } else {
+          await this.send(batch);
+        }
+        this.remember(batch);
+      } catch (err) {
+        this.onError(err); // fail-open: breadcrumbs are best-effort, the batch is dropped
       }
-      this.sent.push(...batch);
-    } catch (err) {
-      this.onError(err); // fail-open: breadcrumbs are best-effort
+    }
+  }
+
+  private remember(batch: ClientEvent[]): void {
+    this.sent.push(...batch);
+    if (this.sent.length > SENT_HISTORY_LIMIT) {
+      this.sent.splice(0, this.sent.length - SENT_HISTORY_LIMIT);
     }
   }
 
   private async send(batch: ClientEvent[]): Promise<void> {
+    if (this.deliveryDisabled) throw this.deliveryDisabled;
     const url = this.endpoint.replace(/\/+$/, "") + "/v1/client-events";
     const body = JSON.stringify({ events: batch });
-    if (typeof fetch === "function") {
-      await fetch(url, {
-        method: "POST",
-        keepalive: true, // survives page navigation
-        headers: { "content-type": "application/json", authorization: `Bearer ${this.publicKey}` },
-        body,
-      });
-    } else {
+    if (typeof fetch !== "function") {
       throw new Error("no fetch available to deliver client events");
     }
+    const res = await fetch(url, {
+      method: "POST",
+      keepalive: true, // survives page navigation
+      headers: { "content-type": "application/json", authorization: `Bearer ${this.publicKey}` },
+      body,
+    });
+    if (!res.ok) {
+      // Ignoring the status hides a revoked key or a bad payload behind a
+      // success log while every breadcrumb goes nowhere.
+      throw new Error(`fin-integrity ingest ${res.status}: ${await safeText(res)}`);
+    }
+    // A 200 means the batch was received, NOT that every breadcrumb was stored:
+    // ingest validates per event and skips the ones it can't use. Treating 200 as
+    // total success hides dropped money-adjacent events behind a success log.
+    const rejected = await rejectedFrom(res, batch);
+    if (rejected.length > 0) throw new RejectedEventsError(rejected, batch.length);
+    if (this.debug) console.log(`[fin-integrity] delivered ${batch.length} client event(s)`);
+  }
+
+  /** Drain and stop the client (timers + page listeners). Call before discarding it. */
+  async shutdown(): Promise<void> {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+    for (const off of this.listeners.splice(0, this.listeners.length)) {
+      try { off(); } catch { /* fail-open */ }
+    }
+    await this.flush();
   }
 
   /** Breadcrumbs captured so far (tests / debugging). */
   inspect(): ClientEvent[] {
     return [...this.sent, ...this.queue];
   }
+}
+
+/**
+ * Rejected breadcrumbs reported inside a 200 body. Ingest answers `{accepted: n}`
+ * and skips what it can't store; `{results:[…]}` is the richer shape the events
+ * endpoint uses. Read both — an unparseable body means nothing to report.
+ */
+async function rejectedFrom(res: Response, batch: ClientEvent[]): Promise<RejectedEvent[]> {
+  let body: {
+    accepted?: unknown;
+    results?: Array<{ event_id?: string; status?: string; error?: string }>;
+  };
+  try {
+    body = await res.clone().json();
+  } catch {
+    return [];
+  }
+  if (Array.isArray(body?.results)) {
+    return body.results
+      .filter((r) => r?.status === "rejected")
+      .map((r) => ({ event_id: r.event_id ?? "unknown", error: r.error ?? "unknown error" }));
+  }
+  if (typeof body?.accepted === "number" && body.accepted < batch.length) {
+    const missing = batch.length - body.accepted;
+    return [{
+      event_id: batch.map((e) => e.trace_id).join(","),
+      error: `ingest accepted ${body.accepted}/${batch.length}; ${missing} breadcrumb(s) were not stored`,
+    }];
+  }
+  return [];
+}
+
+async function safeText(res: Response): Promise<string> {
+  try {
+    return await res.text();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Breadcrumb data crosses JSON. A circular or unserializable payload would throw
+ * at send time and take the whole batch — including other traces — with it, so
+ * it is caught here: keep the breadcrumb (the trace is what matters), drop data.
+ */
+function safeData(data: Record<string, unknown>, onError: (e: unknown) => void): Record<string, unknown> {
+  try {
+    JSON.stringify(data);
+    return data;
+  } catch (err) {
+    onError(err);
+    return { _fi_unserializable: true };
+  }
+}
+
+function positiveInt(v: unknown, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
 }
 
 function newTraceId(): string {
