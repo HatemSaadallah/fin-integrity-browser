@@ -28,6 +28,24 @@ describe("FinIntegrityBrowser", () => {
     expect(events[0].trace_id).toBe(traceId);
   });
 
+  it("tags breadcrumbs with a configured environment", () => {
+    const fi = new FinIntegrityBrowser({ transport: () => {}, environment: "staging" });
+    fi.breadcrumb("checkout_started");
+    expect(fi.inspect()[0].environment).toBe("staging");
+  });
+
+  it("omits environment when unset (server defaults to production)", () => {
+    const fi = new FinIntegrityBrowser({ transport: () => {} });
+    fi.breadcrumb("checkout_started");
+    expect(fi.inspect()[0].environment).toBeUndefined();
+  });
+
+  it("drops an invalid environment rather than sending a bad tag", () => {
+    const fi = new FinIntegrityBrowser({ transport: () => {}, environment: "bad env" });
+    fi.breadcrumb("checkout_started");
+    expect(fi.inspect()[0].environment).toBeUndefined();
+  });
+
   it("breadcrumbs share the current trace id", () => {
     const fi = new FinIntegrityBrowser({ transport: () => {} });
     const traceId = fi.startCheckout();

@@ -16,6 +16,7 @@ export interface ClientEvent {
   reference?: string;
   data?: Record<string, unknown>;
   occurred_at: string;
+  environment?: string;
 }
 
 export interface BrowserConfig {
@@ -23,6 +24,9 @@ export interface BrowserConfig {
   publicKey?: string;
   /** Ingest base URL. `/v1/client-events` is appended. */
   endpoint?: string;
+  /** Environment these breadcrumbs belong to (Sentry-style). Keeps a staging
+   *  frontend's breadcrumbs out of production. Server defaults to "production". */
+  environment?: string;
   /** Flush interval in ms. Default 3000. */
   flushMs?: number;
   /** Max breadcrumbs per HTTP request. Default 100 (ingest hard-caps at 500). */
@@ -73,6 +77,7 @@ export interface RejectedEvent {
 export class FinIntegrityBrowser {
   private readonly publicKey: string;
   private readonly endpoint: string;
+  private readonly environment?: string;
   private readonly maxBatchSize: number;
   private readonly maxQueueSize: number;
   private readonly debug: boolean;
@@ -106,6 +111,7 @@ export class FinIntegrityBrowser {
     }
 
     this.endpoint = typeof cfg.endpoint === "string" && cfg.endpoint ? cfg.endpoint : DEFAULT_ENDPOINT;
+    this.environment = cleanEnvironment(cfg.environment);
     this.maxBatchSize = positiveInt(cfg.maxBatchSize, 100);
     this.maxQueueSize = positiveInt(cfg.maxQueueSize, 1000);
     this.customTransport = typeof cfg.transport === "function" ? cfg.transport : undefined;
@@ -176,6 +182,7 @@ export class FinIntegrityBrowser {
         ...(o.reference != null ? { reference: String(o.reference) } : {}),
         ...(data != null ? { data: safeData(data, this.onError) } : {}),
         occurred_at: new Date().toISOString(),
+        ...(this.environment != null ? { environment: this.environment } : {}),
       });
     } catch (err) {
       this.onError(err); // fail-open
@@ -327,6 +334,15 @@ function safeData(data: Record<string, unknown>, onError: (e: unknown) => void):
 
 function positiveInt(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
+}
+
+/** Sentry-style environment validation, matching the ingest server: trimmed;
+ *  <=64 chars; no whitespace or forward slash; not "none". undefined if invalid. */
+function cleanEnvironment(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const v = raw.trim();
+  if (!v || v.length > 64 || /[\s/]/.test(v) || v.toLowerCase() === "none") return undefined;
+  return v;
 }
 
 function newTraceId(): string {
